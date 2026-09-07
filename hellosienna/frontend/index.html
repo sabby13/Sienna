@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HelloSienna</title>
+    <!-- The backend injects <script>window.__HS_TOKEN__=...</script> before </head>
+         at launch. Dev fallback keeps `vite dev` from crashing when unset. -->
+    <script>
+      window.__HS_TOKEN__ = window.__HS_TOKEN__ || "";
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+[project]
+name = "hellosienna"
+version = "0.0.1+m0"
+description = "HelloSienna — local-first persistent AI companion (M0 foundation)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.1",
+    "httpx>=0.26",
+    # Desktop shell. Imported lazily (shell/window.py) so the backend and tests
+    # run in headless/CI environments without a system webview present.
+    "pywebview>=5.0 ; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+hellosienna = "hellosienna.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["hellosienna*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

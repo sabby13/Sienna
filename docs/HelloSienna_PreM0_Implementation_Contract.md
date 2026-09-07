@@ -4,6 +4,10 @@
 
 **Frozen invariant carried into everything below:** the UI never imports cognition code; all UI ↔ core traffic goes through the 127.0.0.1 API. Dependency direction is one-way: `shell → api → core → {persistence, providers}`; nothing points back up; `core/` imports nothing from `api/` or `shell/`.
 
+> **Post-approval amendments (frozen, 2026-09-07).** Two changes were made after approval:
+> - **Change 1 — token transport:** the per-launch token travels **only** as the `X-HS-Token` header, on every protected request including SSE (via authenticated streaming fetch, never native `EventSource`). The token must never appear in a URL/query string, a log line, persisted frontend state, or any repository file. See §3.6.
+> - **Change 2 — soft-delete retrieval invariant:** a tombstoned memory (`deleted_at IS NOT NULL`) must never surface in cognition, retrieval, context construction, vector results, FTS results, or normal Sienna's Mind views — and correctness must not depend on callers remembering a filter. See §1.8.
+
 ---
 
 ## Deliverable 1 — Concrete SQLite Schema (M0–M5)
@@ -15,7 +19,7 @@
 - **Enums:** `TEXT` + `CHECK (col IN (...))` (SQLite has no native enum).
 - **Coarse magnitudes:** `importance`, `confidence` etc. are `LOW|MEDIUM|HIGH` text, never floats.
 - **Connection PRAGMAs (mandatory, set per connection):** `PRAGMA foreign_keys=ON;` *(SQLite does NOT enforce FKs by default — this is a real footgun; enforce in both the app engine and Alembic's `env.py`)*, `PRAGMA journal_mode=WAL;` (lets background cognition read while foreground writes), `PRAGMA busy_timeout=5000;`.
-- **Deletion:** domain records that appear in "Sienna's Mind" are **soft-deleted** via a `deleted_at` tombstone (retrieval filters `deleted_at IS NULL`); a separate privacy "forget" path hard-deletes evidence and cascades. Junction rows use `ON DELETE CASCADE`.
+- **Deletion:** domain records that appear in "Sienna's Mind" are **soft-deleted** via a `deleted_at` tombstone; a separate privacy "forget" path hard-deletes evidence and cascades. The tombstone invariant and how it is made hard to violate are defined in §1.8. Junction rows use `ON DELETE CASCADE`.
 
 ### 1.2 Migration → milestone mapping
 
@@ -147,8 +151,11 @@ CREATE TRIGGER memory_fts_au AFTER UPDATE OF statement ON memory BEGIN
   INSERT INTO memory_fts(memory_fts, rowid, statement) VALUES ('delete', old.rowid, old.statement);
   INSERT INTO memory_fts(rowid, statement) VALUES (new.rowid, new.statement);
 END;
--- NOTE: soft-delete sets deleted_at (an UPDATE that does NOT touch statement), so
--- tombstoned rows remain in memory_fts; retrieval MUST filter memory.deleted_at IS NULL.
+-- SOFT-DELETE (see §1.8): tombstoning is performed ONLY by MemoryRepository.soft_delete(),
+-- which sets deleted_at AND deletes the row's memory_fts entry AND its embedding rows in one
+-- transaction. So FTS and vector candidate sets physically cannot return a tombstoned memory;
+-- the memory + memory_evidence rows are retained for provenance/audit and the hard-delete path.
+-- (The AFTER UPDATE OF statement trigger above is unaffected — it fires only on statement edits.)
 
 -- ============ M3 ============
 CREATE TABLE event (
@@ -213,6 +220,17 @@ HAVING COUNT(DISTINCT e.timeline) > 1
 5. **Polymorphic evidence ref (`ref_kind`/`ref_id`) + snapshot `text_snippet`** — makes evidence self-contained (survives source deletion). Moving to hard FKs later is a rewrite.
 6. **`memory` keeps its rowid for FTS external-content** — never convert `memory` to `WITHOUT ROWID`; it would break `memory_fts`.
 7. **`PRAGMA foreign_keys=ON` per connection** — if any code path forgets it, FKs silently don't enforce. Centralize connection creation so it can't be skipped.
+
+### 1.8 Soft-delete retrieval invariant (Change 2)
+
+**Invariant:** a memory with `deleted_at IS NOT NULL` must never participate in cognition, retrieval, context construction, embeddings/vector results, FTS results, or normal Sienna's Mind views.
+
+Made hard to violate by two mutually-reinforcing mechanisms (belt **and** suspenders), chosen over relying on callers to append `deleted_at IS NULL`:
+
+1. **Tombstoning physically removes the memory from every candidate source.** There is exactly one way to soft-delete — `MemoryRepository.soft_delete(memory_id)` — and in a single transaction it (a) sets `deleted_at`, (b) deletes the row's `memory_fts` entry, and (c) deletes its `embedding` rows. Because FTS and vector candidate generation read only `memory_fts` and `embedding`, a tombstoned memory **cannot be a candidate** — this directly satisfies "vector candidate generation cannot return deleted memories." The `memory` and `memory_evidence` rows are retained for provenance/audit and the privacy hard-delete path.
+2. **All reads funnel through one canonical boundary.** Cognition, retrieval, context building, and Sienna's Mind never issue ad-hoc SQL against `memory`; they call a single `RetrievalRepository`/`MemoryReadRepository` whose base query applies `WHERE deleted_at IS NULL` centrally. A caller cannot accidentally see tombstones because the only query they can reach already excludes them.
+
+Re-embedding/re-indexing paths skip tombstoned rows by construction (they iterate the canonical live query). **Test at M2:** create → tombstone → assert the memory is absent from FTS matches, vector candidates, the retrieval scorer's input, and default Sienna's Mind, while still present (tombstoned) for audit and hard-delete. *(Not built at M0 — memory does not exist until M2; this is the frozen spec M2 must satisfy.)*
 
 ---
 
@@ -379,12 +397,12 @@ class ProvenanceGuard:
 ### 3.6 API streaming contract (FastAPI ↔ React)
 
 - **Bind:** `127.0.0.1:<ephemeral-port>` only. Never `0.0.0.0`.
-- **Auth:** per-launch random token. FastAPI injects `window.__HS_TOKEN__` into the served `index.html` at launch. React sends it as header `X-HS-Token` on every request; missing/wrong ⇒ `401`. For SSE `GET /api/events` (EventSource cannot set headers) the token is passed as a `?token=` query param, validated identically. *(Loopback-only + per-launch token is defense-in-depth against other local processes, not network auth.)*
+- **Auth (Change 1 — one invariant, header only):** per-launch random token. FastAPI injects `window.__HS_TOKEN__` into the served `index.html` at launch (in-memory, not persisted by the frontend). **Every** protected request — plain requests *and* both SSE streams — carries `X-HS-Token: <token>` and nothing else; missing/wrong ⇒ `401`. **Native `EventSource` is not used** (it cannot set headers); the frontend consumes all SSE via authenticated streaming `fetch` + `ReadableStream`, which sets the header normally. The token must never appear in a URL/query string, a log line, persisted frontend state (no `localStorage`/`sessionStorage`), or any repository file. *(Loopback-only + per-launch token is defense-in-depth against other local processes, not network auth.)*
 - **`POST /api/chat`** `{conversation_id, message}` ⇒ `text/event-stream` (read via `fetch` + `ReadableStream`):
   - `event: token` → `data: {"text": "<chunk>"}` (repeated, incremental)
   - `event: done`  → `data: {"message_id": "..."}`
   - `event: error` → `data: {"code": "...", "message": "..."}` (mid-stream failure; client keeps partial text + shows error)
-- **`GET /api/events`** long-lived SSE for **server-initiated** pushes (proactive messages from M3, "state changed" pings). Endpoint shape is frozen now so the React client is stable; it emits nothing until M3.
+- **`GET /api/events`** long-lived SSE for **server-initiated** pushes (proactive messages from M3, "state changed" pings), authenticated by the `X-HS-Token` header and consumed via authenticated streaming `fetch` (not native `EventSource`). Endpoint shape is frozen now so the React client is stable; it emits nothing until M3 (heartbeat comments only).
 - **Errors:** transport/setup failures use HTTP status + `{"error":{"code","message"}}` envelope (never a raw stack trace to the client); in-stream failures use the `error` event above.
 
 ---
